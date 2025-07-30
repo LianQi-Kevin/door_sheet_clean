@@ -1,56 +1,57 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Door digits checker (expected-first, unified LevelGroup)
+Door digits checker & summary (single-file, config-first).
 
-功能概要
---------
-1) 期望优先（expected-first）：
-   - 由真实 宽/高(mm) 生成期望 digits：D{w百毫米[+'']}{h百毫米[+'']}
-     * 宽/高 < 1000mm 时各自 zfill(2) 补零
-     * 非整百在对应段后加英文单引号 '
-   - 在型号中用严格边界 (?<!\\d) ... (?!\\d) 搜索该期望 digits
-   - 命中则 match=True，否则 False；若宽/高缺失或无法生成期望 digits，则 match=pd.NA
-   - 同时保留 reason_code / reason_detail 说明不匹配原因
+保持现有功能/口径不变：
+- 文本归一化：NFKC + 空白折叠 + 常见占位串视为缺失（避免 "nan"/"<NA>" 注入）；
+- 忽略备注关键字（字面量匹配，NA 不命中）；
+- 饰面同义词映射、token 化去重、连接符；
+- “宽口径”判定：备注/饰面在分组内若唯一 → 只输出标题，不列“门编号”；多值 → 按值分块并列门清单；
+- 行级 digits 校验：expected-first 生成 + 严格边界匹配 + 期望型号替换/追加；
+- 输出：地上/地下楼层（若有）+ digits行级校验。
 
-2) 地上/地下汇总通过 LevelGroup 统一配置与逻辑，减少重复代码。
-
-3) CLI：
-   - 未传 --sheet → 读取首个 sheet（sheet_name=0）
-   - 未传 --log-level → 默认 INFO
-   - --only-errors 只输出 match != True 的行（行级 sheet）
-
-依赖
-----
-- pandas
-- openpyxl
+调用方式（程序化）：
+    from pathlib import Path
+    from door_digits_single import run
+    run(Path("input.xlsx"), Path("output.xlsx"), only_errors=False)
 """
 
 from __future__ import annotations
 
-import argparse
-import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Tuple, Dict, List
+from typing import Iterable, List, Dict, Tuple, Optional
 
 import pandas as pd
+import unicodedata
+from pandas._libs.missing import NAType
 
-# ----------------------- Defaults -----------------------
-DEFAULT_INPUT: Path = Path("sample_excel.xlsx")
-DEFAULT_OUTPUT: Path = Path("target_excel.xlsx")
-DEFAULT_SHEET: Optional[str] = None  # None → 读首个 sheet
-DEFAULT_LOG_LEVEL: str = "INFO"
+# ========================== 配置（文件头、全大写） ==========================
+# 文本归一化
+NORMALIZE_FORM: str = "NFKC"  # 可选: "NFC"/"NFKC"/"NFD"/"NFKD"
+CASEFOLD_TEXT: bool = False  # 如需不区分大小写匹配，可设 True
 
-# 统一替换型号中旧 digits 的正则（把任何 D[0-9'…] 替换为新的期望 digits）
-PAT_ANY_DIGITS = re.compile(r"(?<!\d)D[0-9'\u2019]+(?!\d)")
+# 常见占位串（归一化后以缺失处理）
+MISSING_STRINGS: set[str] = {"", "nan", "none", "null", "<na>", "n/a", "na"}
 
-logger = logging.getLogger(__name__)
+# 备注忽略（字面量包含；NA 不命中）
+IGNORE_REMARK_SUBSTRINGS: List[str] = ["门槛"]
+IGNORE_REMARK_CASE_SENSITIVE: bool = True  # True=区分大小写
+
+# 饰面同义词映射 & token 连接符
+FINISH_SYNONYMS: Dict[str, str] = {"喷涂": "静电粉末喷涂", "深灰色静电粉末喷涂": "静电粉末喷涂",
+                                   "WD-21木饰面": "木纹转印", "WD-24木饰面": "木纹转印", "WD-01木饰面": "木纹转印",
+                                   "木纹": "木纹转印", }
+FINISH_TOKEN_JOINER: str = " "  # 例如可改为 "、"
+
+# 备注唯一/多值判定口径（当前为“宽口径”，即只要有效值唯一即可不列门编号）
+STRICT_REMARK_UNIQUENESS: bool = False  # 预留开关：True=严格口径（全组一致才省略门编号）
 
 
-# ----------------------- LevelGroup 配置 -----------------------
-@dataclass
+# 楼层分组配置
+@dataclass(frozen=True)
 class LevelGroup:
     name: str
     levels: List[str]
@@ -77,8 +78,8 @@ ABOVE_GROUP = LevelGroup(name="above",
                                      "F5": "五层门数量",
                                      "F6": "六层门数量", "F7": "七层门数量", "F8": "八层门数量", "F9": "九层门数量",
                                      "F10": "十层门数量",
-                                     "F11": "十一层门数量", "2#机房层": "机房层门数量", },
-                         ordered=["类型", "型号", "开启方式", "洞口尺寸(宽X高)", "一层门数量", "二层门数量",
+                                     "F11": "十一层门数量", "2#机房层": "机房层门数量"},
+                         ordered=["类型", "型号", "洞口尺寸(宽X高)", "开启方式", "一层门数量", "二层门数量",
                                   "三层门数量", "四层门数量",
                                   "五层门数量", "六层门数量", "七层门数量", "八层门数量", "九层门数量", "十层门数量",
                                   "十一层门数量",
@@ -87,67 +88,228 @@ ABOVE_GROUP = LevelGroup(name="above",
 LEVEL_GROUPS: List[LevelGroup] = [BASEMENT_GROUP, ABOVE_GROUP]
 
 
-# ----------------------- Logging -----------------------
-def configure_logging(level: str = DEFAULT_LOG_LEVEL) -> None:
-    """Quick root logger config (官方文档推荐用法)."""
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO),
-                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", )
-    logger.debug("logging configured at %s", level)
+# ========================== 文本/通用工具 ==========================
+def normalize_text(value: object, nf: str = NORMALIZE_FORM, casefold: bool = CASEFOLD_TEXT) -> str | NAType:
+    """
+    归一化文本：NFKC + 空白折叠 + 常见占位串视为缺失；必要时大小写规约。
+    返回：规范化后的 str；若视为缺失则返回 pd.NA。
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return pd.NA
+    s = str(value).strip()
+    if not s:
+        return pd.NA
+    s = unicodedata.normalize(nf, s)
+    s = s.replace("（", "(").replace("）", ")")
+    s = re.sub(r"\s+", " ", s).strip()
+    if s.casefold() in MISSING_STRINGS:
+        return pd.NA
+    if casefold:
+        s = s.casefold()
+    return s if s else pd.NA
 
 
-# ----------------------- Common utils -----------------------
-def _is_missing(val: object) -> bool:
-    if pd.isna(val):
-        return True
-    s = str(val).strip()
-    return s in ("", "nan", "NaN")
+def fmt_cell(x: object) -> Optional[str]:
+    """门编号/层号安全格式化；缺失返回 None（避免 'nan' 注入拼装文本）。"""
+    nx = normalize_text(x)
+    if nx is pd.NA:
+        return None
+    return str(nx)
 
 
-def build_note(group: pd.DataFrame, basement_levels: Iterable[str]) -> str:
-    """聚合备注（地下层门编号追加“（B?层）”），保持你原有逻辑。"""
-    basement_set = set(basement_levels)
-    valid = group[~group["备注"].apply(_is_missing)]
+def filter_remarks_for_ignore(series: pd.Series) -> pd.Series:
+    """
+    忽略备注关键字（字面量包含、可选大小写；NA 不命中）。
+    返回：归一化+忽略后的 Series。
+    """
+    s = series.map(lambda x: normalize_text(x))
+    if not IGNORE_REMARK_SUBSTRINGS:
+        return s
+    mask = pd.Series(False, index=s.index)
+    for kw in IGNORE_REMARK_SUBSTRINGS:
+        if not kw:
+            continue
+        mask |= s.str.contains(kw, case=IGNORE_REMARK_CASE_SENSITIVE, regex=False, na=False)
+    return s.mask(mask, other=pd.NA)
+
+
+def split_finish_tokens(x: object, synonym_map: Dict[str, str] | None = None) -> List[str]:
+    """饰面分词：按常见分隔符拆分 → 同义词映射 → 去重（保序）。"""
+    s = normalize_text(x)
+    if s is pd.NA:
+        return []
+    parts = re.split(r"[、/;；,，\s]+", s)
+    toks, seen = [], set()
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if synonym_map:
+            p = synonym_map.get(p, p)
+        if p not in seen:
+            seen.add(p)
+            toks.append(p)
+    return toks
+
+
+def stable_join_tokens(tokens: List[str], joiner: str = FINISH_TOKEN_JOINER) -> str:
+    """稳定连接 tokens（不排序，保出现顺序）。"""
+    return joiner.join(tokens)
+
+
+def parse_mm_series(s: pd.Series) -> pd.Series:
+    """宽/高清洗：数字化→四舍五入→可空 Int64。"""
+    return pd.to_numeric(s, errors="coerce").round().astype("Int64")
+
+
+# ========================== 备注/饰面块拼装 ==========================
+def _build_block_unique_or_grouped(values_series: pd.Series, title: str, group_rows: pd.DataFrame,
+                                   basement_levels: Iterable[str]) -> str:
+    """
+    通用块构造：唯一→只标题；多值→标题+门清单。
+    values_series：每行已标准化的“展示值”（备注或饰面），允许 NA。
+    """
+    valid = values_series.dropna()
     if valid.empty:
         return ""
-    if valid["备注"].nunique() == 1 and len(valid) == len(group):
-        return str(valid["备注"].iloc[0]).strip()
 
+    uniq_values = pd.Series(valid).unique()  # 保序、无排序
+    # 宽口径：只要有效值唯一即可不列门编号；严格口径（可选）
+    if (not STRICT_REMARK_UNIQUENESS and len(uniq_values) == 1) or (
+            STRICT_REMARK_UNIQUENESS and len(valid.unique()) == 1 and valid.size == len(group_rows)):
+        return f"{title}: {uniq_values[0]}"
+
+    basement_set = set(str(x).strip() for x in basement_levels)
     blocks: list[str] = []
-    for remark, grp in valid.groupby("备注", sort=False):
-        lines = [f"备注: {str(remark).strip()}"]
-        doors = (grp.apply(lambda r: (
-            f"{str(r['门编号']).strip()}（{r['层号']}层）" if str(r["层号"]).strip() in basement_set else str(
-                r["门编号"]).strip()), axis=1, ).unique())
-        lines.append(f"门编号: {'、'.join(doors)}")
-        blocks.append("\n".join(lines))
+    # 将标准化值回写后分组
+    df2 = group_rows.copy()
+    colname = f"__{title}_norm__"
+    df2[colname] = values_series
+    for v, grp in df2.dropna(subset=[colname]).groupby(colname, sort=False):
+        vtxt = fmt_cell(v)
+        if not vtxt:
+            continue
+        # 组内门编号清单
+        doors_list: list[str] = []
+        for _, r in grp.iterrows():
+            num = fmt_cell(r.get("门编号"))
+            level = fmt_cell(r.get("层号"))
+            if num is None:
+                continue
+            if level in basement_set and level is not None:
+                doors_list.append(f"{num}（{level}层）")
+            else:
+                doors_list.append(num)
+        doors_list = pd.unique(doors_list).tolist()
+        if not doors_list:
+            continue
+        blocks.append(f"{title}: {vtxt}\n门编号: " + "、".join(doors_list))
     return "\n\n".join(blocks)
 
 
-def clean_base(df: pd.DataFrame) -> pd.DataFrame:
+def build_finish_note(group: pd.DataFrame, basement_levels: Iterable[str]) -> str:
+    """饰面块：token 化→同义词→去重→展示值；唯一→只标题， 多值→标题+门清单。"""
+    if "饰面" not in group.columns:
+        return ""
+    tok_series = group["饰面"].apply(lambda v: split_finish_tokens(v, synonym_map=FINISH_SYNONYMS))
+    disp_series = tok_series.apply(lambda toks: stable_join_tokens(toks, FINISH_TOKEN_JOINER) if toks else pd.NA)
+    return _build_block_unique_or_grouped(disp_series, "饰面", group, basement_levels)
+
+
+def build_note_original_like(group: pd.DataFrame, basement_levels: Iterable[str]) -> str:
+    """备注块：归一化→忽略关键字→唯一/多值分支（与饰面一致口径）。"""
+    if "备注" not in group.columns:
+        return ""
+    remarks_norm = filter_remarks_for_ignore(group["备注"])
+    return _build_block_unique_or_grouped(remarks_norm, "备注", group, basement_levels)
+
+
+def build_note_with_finish(group: pd.DataFrame, basement_levels: Iterable[str]) -> str:
+    """合并备注块与饰面块（以空行分隔），任一为空则只返回另一个。"""
+    note_block = build_note_original_like(group, basement_levels)
+    finish_block = build_finish_note(group, basement_levels)
+    if note_block and finish_block:
+        return f"{note_block}\n\n{finish_block}"
+    return note_block or finish_block or ""
+
+
+# ========================== 数据清洗与汇总 ==========================
+def clean_base_keep_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    基础清洗：列名去空格；门型→型号；关键文本列使用 StringDtype 并做基本规范化；
+    保留原始列（不做无关列删除）。
+    """
     df = df.copy()
     df.columns = df.columns.str.replace(" ", "", regex=False)
-    for col in df.columns:
-        df[col] = df[col].astype(str).str.replace(" ", "", regex=False)
-    df = df.drop(columns=["防火门区域", "房间功能", "防火级别", "区域"], errors="ignore")
+
     if "门型" in df.columns:
+        df["门型"] = df["门型"].astype("string")
         df["门型"] = (
             df["门型"].str.replace("（", "(", regex=False).str.replace(
                 "）", ")", regex=False).str.replace("’", "'", regex=False).str.replace(
                 "‘", "'", regex=False))
-    return df.rename(columns={"门样式": "类型", "门型": "型号"})
+    df = df.rename(columns={"门样式": "类型", "门型": "型号"})
+
+    # 统一文本列为 StringDtype，保持 <NA> 语义；避免 astype(str) 产生 'nan'
+    for c in [c for c in ("类型", "型号", "层号", "门编号", "备注", "门扇", "饰面") if c in df.columns]:
+        df[c] = df[c].astype("string")
+        df[c] = df[c].str.replace(" ", "", regex=False).str.strip()
+
+    return df
 
 
-# ----------------------- expected-first 主逻辑 -----------------------
+def summarize_group(df_clean: pd.DataFrame, group: LevelGroup, basement_levels_for_note: Iterable[str]) -> pd.DataFrame:
+    """
+    单组（地上/地下）汇总：洞口尺寸、开启方式、楼层计数、备注拼装与列顺序。
+    """
+    df_sub = group.filter_df(df_clean).copy()
+    if df_sub.empty:
+        return pd.DataFrame(columns=group.ordered)
+
+    # 洞口尺寸 & 开启方式
+    w = parse_mm_series(df_sub["宽度"])
+    h = parse_mm_series(df_sub["高度"])
+    df_sub["洞口尺寸(宽X高)"] = pd.Series(
+        [f"{int(wi)}X{int(hi)}" if pd.notna(wi) and pd.notna(hi) else pd.NA for wi, hi in zip(w, h)], dtype="string")
+    df_sub["开启方式"] = df_sub["门扇"].map({"单扇": "单扇平开", "双扇": "双扇平开"}).astype("string")
+
+    # 计数透视
+    counts = (df_sub.groupby(["类型", "型号", "层号"]).size().unstack(fill_value=0).reset_index().sort_values(
+        ["类型", "型号"]))
+
+    # 合计及重命名
+    level_cols_present = [c for c in group.levels if c in counts.columns]
+    counts["合计"] = counts[level_cols_present].sum(axis=1) if level_cols_present else 0
+    counts = counts.rename(columns=group.rename_map)
+    level_cols_renamed = [group.rename_map.get(c, c) for c in level_cols_present]
+    if level_cols_renamed:
+        counts[level_cols_renamed] = counts[level_cols_renamed].replace(0, "")
+
+    # 备注/饰面汇总
+    extras = (df_sub.groupby(["类型", "型号"], sort=False).apply(lambda g: pd.Series(
+        {"洞口尺寸(宽X高)": "，".join(pd.Series(g["洞口尺寸(宽X高)"].dropna().astype("string")).unique()),
+         "开启方式": "，".join(pd.Series(g["开启方式"].dropna().astype("string")).unique()),
+         "备注": build_note_with_finish(g, basement_levels_for_note), })).reset_index())
+
+    result = counts.merge(extras, on=["类型", "型号"], how="left")
+    return result.reindex(columns=group.ordered_columns(result.columns))
+
+
+# ========================== 行级 digits 校验 ==========================
+PAT_ANY_DIGITS = re.compile(r"(?<!\d)D[0-9'\u2019]+(?!\d)")
+
+
 def build_expected_digits(width_mm: object, height_mm: object, pad_to: int = 2) -> Tuple[str, str]:
     """
     由真实宽/高(mm)生成期望 digits：
       expected_with_D: "Dxx'yy'"
       expected_core  : "xx'yy'"
-    宽/高 < 1000mm 时各自补零到 2 位；非整百追加英文单引号 '。
+    宽/高 < 1000mm 时各自补零到 pad_to 位；非整百追加英文单引号 '。
     """
     if pd.isna(width_mm) or pd.isna(height_mm):
         return "", ""
-    w, h = int(width_mm), int(height_mm)
+    w = int(width_mm)
+    h = int(height_mm)
     w_code = str(w // 100).zfill(pad_to)
     h_code = str(h // 100).zfill(pad_to)
     w_q = "'" if (w % 100) else ""
@@ -157,32 +319,30 @@ def build_expected_digits(width_mm: object, height_mm: object, pad_to: int = 2) 
 
 
 def make_expected_model(model: str, expected_with_D: str) -> str:
-    """将型号中旧 digits 段整体替换为期望 digits；没有则直接追加。"""
+    """在型号中将旧 digits 段整体替换为期望 digits；没有则尾部追加。"""
     model = str(model or "")
+    if not expected_with_D:
+        return model
     if PAT_ANY_DIGITS.search(model):
         return PAT_ANY_DIGITS.sub(expected_with_D, model)
     return f"{model} {expected_with_D}".strip()
 
 
-def build_row_level_expected_first(df: pd.DataFrame, basement_levels: Iterable[str]) -> pd.DataFrame:
+def build_row_level_expected_first(df: pd.DataFrame) -> pd.DataFrame:
     """
-    生成 digits 行级校验表（保留 match + reason_code/reason_detail）：
-    - match=True  : 型号中找到了严格边界匹配的期望 digits
-    - match=False : 能生成期望 digits，但型号里没找到它
+    行级 digits 校验表（match + reason_code/reason_detail + 期望型号）：
+    - match=True  : 型号包含严格边界匹配的期望 digits
+    - match=False : 能生成期望 digits，但型号里没找到
     - match=pd.NA : 宽/高缺失或无法生成期望 digits
     """
     work = df.copy()
+    work["宽度_mm"] = parse_mm_series(work["宽度"])
+    work["高度_mm"] = parse_mm_series(work["高度"])
 
-    # 1) 宽/高清洗
-    work["宽度_mm"] = pd.to_numeric(work["宽度"], errors="coerce").round().astype("Int64")
-    work["高度_mm"] = pd.to_numeric(work["高度"], errors="coerce").round().astype("Int64")
-
-    # 2) 由真实宽高中构造期望 digits
     exp = work.apply(lambda r: pd.Series(build_expected_digits(r["宽度_mm"], r["高度_mm"], pad_to=2),
                                          index=["expected_with_D", "expected_core"]), axis=1)
     work = pd.concat([work, exp], axis=1)
 
-    # 3) 分类 & match 判定（内部使用严格边界正则，但不输出）
     def _did_match(row: pd.Series) -> bool:
         if not row["expected_with_D"]:
             return False
@@ -199,102 +359,45 @@ def build_row_level_expected_first(df: pd.DataFrame, basement_levels: Iterable[s
         return False, "expected_not_found", "型号未包含以真实尺寸派生的期望 digits，请手动核对/修正"
 
     work[["match", "reason_code", "reason_detail"]] = work.apply(classify, axis=1, result_type="expand")
-
-    # 4) 期望型号（建议应改成什么）
     work["期望型号"] = work.apply(lambda r: make_expected_model(r["型号"], r["expected_with_D"]), axis=1)
 
-    # 5) 日志（match=True→DEBUG，其余→WARNING）
-    for idx, r in work.iterrows():
-        msg = (f"row={idx} 型号={r.get('型号')} 宽高=({r.get('宽度_mm')}x{r.get('高度_mm')}) "
-               f"expected={r.get('expected_with_D')} match={r.get('match')} reason={r.get('reason_code')}")
-        (logger.debug if r["match"] is True else logger.warning)(msg)
-
-    # 6) 输出列
-    remark_col = "备注" if "备注" in work.columns else None
     cols = [c for c in ["层号" if "层号" in work.columns else None, "门编号" if "门编号" in work.columns else None,
                         "类型" if "类型" in work.columns else None, "型号", "期望型号", "宽度_mm", "高度_mm",
-                        "expected_with_D", "expected_core", "match", "reason_code", "reason_detail", remark_col,
-                        ] if c is not None]
+                        "expected_with_D",
+                        "expected_core", "match", "reason_code", "reason_detail",
+                        "备注" if "备注" in work.columns else None] if
+            c is not None]
     return work[cols]
 
 
-# ----------------------- 统一楼层组汇总 -----------------------
-def summarize_group(df_clean: pd.DataFrame, group: LevelGroup, basement_levels_for_note: Iterable[str]) -> pd.DataFrame:
-    df_sub = group.filter_df(df_clean).copy()
-    if df_sub.empty:
-        return pd.DataFrame(columns=group.ordered)
+# ========================== 顶层入口（程序化调用） ==========================
+def run(input_path: Path, output_path: Path, only_errors: bool = False) -> None:
+    """
+    读取 Excel → 清洗 → 汇总（地上/地下）→ digits行级校验 → 写出。
+    参数:
+        input_path  : 输入 Excel 路径
+        output_path : 输出 Excel 路径
+        only_errors : True 时，digits 行级校验仅输出 match != True 的行
+    """
+    df_raw = pd.read_excel(input_path, sheet_name=0, header=0)
+    df_clean = clean_base_keep_columns(df_raw)
 
-    # 洞口尺寸 & 开启方式
-    w = pd.to_numeric(df_sub["宽度"], errors="coerce").round().astype("Int64")
-    h = pd.to_numeric(df_sub["高度"], errors="coerce").round().astype("Int64")
-    df_sub["洞口尺寸(宽X高)"] = w.astype(str) + "X" + h.astype(str)
-    df_sub["开启方式"] = df_sub["门扇"].map({"单扇": "单扇平开", "双扇": "双扇平开"})
-
-    # 计数透视
-    counts = (df_sub.groupby(["类型", "型号", "层号"]).size().unstack(fill_value=0).reset_index().sort_values(
-        ["类型", "型号"]))
-
-    # 合计（只统计本组包含且真实存在的列）
-    level_cols_present = [c for c in group.levels if c in counts.columns]
-    counts["合计"] = counts[level_cols_present].sum(axis=1) if level_cols_present else 0
-
-    # 重命名并替换 0 为 ""（仅楼层列）
-    counts = counts.rename(columns=group.rename_map)
-    level_cols_renamed = [group.rename_map.get(c, c) for c in level_cols_present]
-    if level_cols_renamed:
-        counts[level_cols_renamed] = counts[level_cols_renamed].replace(0, "")
-
-    # 附加尺寸、开启方式、备注
-    extras = (df_sub.groupby(["类型", "型号"], sort=False).apply(lambda g: pd.Series(
-        {"洞口尺寸(宽X高)": "，".join(pd.Series(g["洞口尺寸(宽X高)"].dropna().astype(str)).unique()),
-         "开启方式": "，".join(pd.Series(g["开启方式"].dropna().astype(str)).unique()),
-         "备注": build_note(g, basement_levels_for_note), })).reset_index())
-
-    result = counts.merge(extras, on=["类型", "型号"], how="left")
-    return result.reindex(columns=group.ordered_columns(result.columns))
-
-
-# ----------------------- CLI -----------------------
-def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Door digits checker (expected-first, unified groups).",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("-i", "--input", type=Path, default=DEFAULT_INPUT, help="Input Excel path.")
-    parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT, help="Output Excel path.")
-    parser.add_argument("-s", "--sheet", type=str, default=DEFAULT_SHEET,
-                        help="Sheet name to read. Omit to read the first sheet.")
-    parser.add_argument("--log-level", type=str, default=DEFAULT_LOG_LEVEL,
-                        help="Logging level (DEBUG, INFO, WARNING, ERROR).")
-    parser.add_argument("--only-errors", action="store_true",
-                        help="Only keep rows where match != True in row-level sheet.")
-    return parser.parse_args(argv)
-
-
-def main(argv: Optional[Iterable[str]] = None) -> None:
-    args = parse_args(argv)
-    configure_logging(args.log_level)
-
-    # --sheet 未给 → 读首个 sheet（pandas: sheet_name=0）
-    sheet_to_read: int | str = 0 if args.sheet is None else args.sheet
-    logger.info("reading %s (sheet=%s)", args.input, sheet_to_read)
-    df_raw = pd.read_excel(args.input, sheet_name=sheet_to_read, header=0)
-
-    df_clean = clean_base(df_raw)
-
-    # 行级校验
-    row_level = build_row_level_expected_first(df_clean, basement_levels=BASEMENT_GROUP.levels)
-    if args.only_errors:
-        row_level = row_level[row_level["match"].ne(True)]
-
-    # 分组汇总
-    with pd.ExcelWriter(args.output, engine="openpyxl") as writer:
-        for group in LEVEL_GROUPS:
-            tbl = summarize_group(df_clean, group, basement_levels_for_note=BASEMENT_GROUP.levels)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        # 楼层组汇总
+        for grp in LEVEL_GROUPS:
+            tbl = summarize_group(df_clean, grp, basement_levels_for_note=BASEMENT_GROUP.levels)
             if not tbl.empty:
-                tbl.to_excel(writer, sheet_name=group.sheet_name, index=False)
+                tbl.to_excel(writer, sheet_name=grp.sheet_name, index=False)
+
+        # digits 行级校验
+        row_level = build_row_level_expected_first(df_clean)
+        if only_errors:
+            row_level = row_level[row_level["match"].ne(True)]
         row_level.to_excel(writer, sheet_name="digits行级校验", index=False)
 
-    logger.info("done -> %s", args.output)
 
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    input_file = Path(r"sample_excel.xlsx")
+    output_file = Path(r"target_excel.xlsx")
+    run(input_file, output_file, only_errors=False)
+    print(f"Processed {input_file} and saved results to {output_file}.")
